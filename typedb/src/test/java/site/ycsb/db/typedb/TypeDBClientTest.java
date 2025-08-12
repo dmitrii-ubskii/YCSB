@@ -56,7 +56,6 @@ public class TypeDBClientTest {
     instance = new TypeDBClient();
 
     final Properties properties = new Properties();
-    properties.setProperty(TypeDBClient.PROPERTY_ROCKSDB_DIR, tmpFolder.getRoot().getAbsolutePath());
     instance.setProperties(properties);
 
     instance.init();

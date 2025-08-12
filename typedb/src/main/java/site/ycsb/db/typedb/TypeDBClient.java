@@ -17,451 +17,269 @@
 
 package site.ycsb.db.typedb;
 
+import com.typedb.driver.TypeDB;
+import com.typedb.driver.api.Credentials;
+import com.typedb.driver.api.Driver;
+import com.typedb.driver.api.DriverOptions;
+import com.typedb.driver.api.Transaction;
+import com.typedb.driver.api.answer.ConceptDocumentIterator;
+import com.typedb.driver.api.answer.ConceptRowIterator;
+import com.typedb.driver.api.answer.JSON;
+import com.typedb.driver.common.exception.TypeDBDriverException;
 import site.ycsb.*;
 import site.ycsb.Status;
 import net.jcip.annotations.GuardedBy;
-import org.rocksdb.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.file.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
- * RocksDB binding for <a href="http://rocksdb.org/">RocksDB</a>.
- *
- * See {@code rocksdb/README.md} for details.
+ * TypeDB binding
+ * <p>
+ * See {@code typedb/README.md} for details.
  */
 public class TypeDBClient extends DB {
-
-  static final String PROPERTY_ROCKSDB_DIR = "rocksdb.dir";
-  static final String PROPERTY_ROCKSDB_OPTIONS_FILE = "rocksdb.optionsfile";
-  private static final String COLUMN_FAMILY_NAMES_FILENAME = "CF_NAMES";
+  private static final String DATABASE_NAME = "ycsb";
 
   private static final Logger LOGGER = LoggerFactory.getLogger(TypeDBClient.class);
 
-  @GuardedBy("TypeDBClient.class") private static Path rocksDbDir = null;
-  @GuardedBy("TypeDBClient.class") private static Path optionsFile = null;
-  @GuardedBy("TypeDBClient.class") private static RocksObject dbOptions = null;
-  @GuardedBy("TypeDBClient.class") private static RocksDB rocksDb = null;
-  @GuardedBy("TypeDBClient.class") private static int references = 0;
-
-  private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
-  private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
+  @GuardedBy("TypeDBClient.class")
+  private static Driver driver = null;
 
   @Override
-  public void init() throws DBException {
-    synchronized(TypeDBClient.class) {
-      if(rocksDb == null) {
-        rocksDbDir = Paths.get(getProperties().getProperty(PROPERTY_ROCKSDB_DIR));
-        LOGGER.info("RocksDB data dir: " + rocksDbDir);
-
-        String optionsFileString = getProperties().getProperty(PROPERTY_ROCKSDB_OPTIONS_FILE);
-        if (optionsFileString != null) {
-          optionsFile = Paths.get(optionsFileString);
-          LOGGER.info("RocksDB options file: " + optionsFile);
+  public void init() {
+    synchronized (TypeDBClient.class) {
+      if (driver == null) {
+        driver = TypeDB.driver(TypeDB.DEFAULT_ADDRESS, new Credentials("admin", "password"),
+            new DriverOptions(false, null)
+        );
+        if (!driver.databases().contains(DATABASE_NAME)) {
+          driver.databases().create(DATABASE_NAME);
         }
-
-        try {
-          if (optionsFile != null) {
-            rocksDb = initRocksDBWithOptionsFile();
-          } else {
-            rocksDb = initRocksDB();
-          }
-        } catch (final IOException | RocksDBException e) {
-          throw new DBException(e);
+        try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.SCHEMA)) {
+          String schema = "define entity table, owns id, plays table-key:table;\n" +
+              "entity key, owns id, plays table-key:key, plays key-field:key;\n" +
+              "entity field, owns id, owns val, plays key-field:field;\n" +
+              "relation table-key, relates table, relates key;\n" +
+              "relation key-field, relates key, relates field;\n" + "attribute id, value string;\n" +
+              "attribute val, value string;\n";
+          transaction.query(schema).resolve();
+          transaction.commit();
         }
       }
-
-      references++;
     }
   }
 
   /**
-   * Initializes and opens the RocksDB database.
-   *
-   * Should only be called with a {@code synchronized(TypeDBClient.class)` block}.
-   *
-   * @return The initialized and open RocksDB instance.
+   * Cleanup any state for this DB.
+   * Called once per DB instance; there is one DB instance per client thread.
    */
-  private RocksDB initRocksDBWithOptionsFile() throws IOException, RocksDBException {
-    if(!Files.exists(rocksDbDir)) {
-      Files.createDirectories(rocksDbDir);
-    }
-
-    final DBOptions options = new DBOptions();
-    final List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
-    final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
-
-    RocksDB.loadLibrary();
-    OptionsUtil.loadOptionsFromFile(optionsFile.toAbsolutePath().toString(), Env.getDefault(), options, cfDescriptors);
-    dbOptions = options;
-
-    final RocksDB db = RocksDB.open(options, rocksDbDir.toAbsolutePath().toString(), cfDescriptors, cfHandles);
-
-    for(int i = 0; i < cfDescriptors.size(); i++) {
-      String cfName = new String(cfDescriptors.get(i).getName());
-      final ColumnFamilyHandle cfHandle = cfHandles.get(i);
-      final ColumnFamilyOptions cfOptions = cfDescriptors.get(i).getOptions();
-
-      COLUMN_FAMILIES.put(cfName, new ColumnFamily(cfHandle, cfOptions));
-    }
-
-    return db;
-  }
-
-  /**
-   * Initializes and opens the RocksDB database.
-   *
-   * Should only be called with a {@code synchronized(TypeDBClient.class)` block}.
-   *
-   * @return The initialized and open RocksDB instance.
-   */
-  private RocksDB initRocksDB() throws IOException, RocksDBException {
-    if(!Files.exists(rocksDbDir)) {
-      Files.createDirectories(rocksDbDir);
-    }
-
-    final List<String> cfNames = loadColumnFamilyNames();
-    final List<ColumnFamilyOptions> cfOptionss = new ArrayList<>();
-    final List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
-
-    for(final String cfName : cfNames) {
-      final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
-          .optimizeLevelStyleCompaction();
-      final ColumnFamilyDescriptor cfDescriptor = new ColumnFamilyDescriptor(
-          cfName.getBytes(UTF_8),
-          cfOptions
-      );
-      cfOptionss.add(cfOptions);
-      cfDescriptors.add(cfDescriptor);
-    }
-
-    final int rocksThreads = Runtime.getRuntime().availableProcessors() * 2;
-
-    if(cfDescriptors.isEmpty()) {
-      final Options options = new Options()
-          .optimizeLevelStyleCompaction()
-          .setCreateIfMissing(true)
-          .setCreateMissingColumnFamilies(true)
-          .setIncreaseParallelism(rocksThreads)
-          .setMaxBackgroundCompactions(rocksThreads)
-          .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
-      dbOptions = options;
-      return RocksDB.open(options, rocksDbDir.toAbsolutePath().toString());
-    } else {
-      final DBOptions options = new DBOptions()
-          .setCreateIfMissing(true)
-          .setCreateMissingColumnFamilies(true)
-          .setIncreaseParallelism(rocksThreads)
-          .setMaxBackgroundCompactions(rocksThreads)
-          .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
-      dbOptions = options;
-
-      final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
-      final RocksDB db = RocksDB.open(options, rocksDbDir.toAbsolutePath().toString(), cfDescriptors, cfHandles);
-      for(int i = 0; i < cfNames.size(); i++) {
-        COLUMN_FAMILIES.put(cfNames.get(i), new ColumnFamily(cfHandles.get(i), cfOptionss.get(i)));
-      }
-      return db;
-    }
-  }
-
   @Override
   public void cleanup() throws DBException {
     super.cleanup();
-
-    synchronized (TypeDBClient.class) {
-      try {
-        if (references == 1) {
-          for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
-            cf.getHandle().close();
-          }
-
-          rocksDb.close();
-          rocksDb = null;
-
-          dbOptions.close();
-          dbOptions = null;
-
-          for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
-            cf.getOptions().close();
-          }
-          saveColumnFamilyNames();
-          COLUMN_FAMILIES.clear();
-
-          rocksDbDir = null;
-        }
-
-      } catch (final IOException e) {
-        throw new DBException(e);
-      } finally {
-        references--;
-      }
-    }
   }
 
-  @Override
-  public Status read(final String table, final String key, final Set<String> fields,
-      final Map<String, ByteIterator> result) {
-    try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
-
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      final byte[] values = rocksDb.get(cf, key.getBytes(UTF_8));
-      if(values == null) {
-        return Status.NOT_FOUND;
-      }
-      deserializeValues(values, fields, result);
-      return Status.OK;
-    } catch(final RocksDBException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
+  private String escape(String s) {
+    String z = s.replace("\\", "\\\\").replace("\"", "\\\"");
+    System.out.println(z);
+    return z;
   }
 
-  @Override
-  public Status scan(final String table, final String startkey, final int recordcount, final Set<String> fields,
-        final Vector<HashMap<String, ByteIterator>> result) {
-    try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
-
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      try(final RocksIterator iterator = rocksDb.newIterator(cf)) {
-        int iterations = 0;
-        for (iterator.seek(startkey.getBytes(UTF_8)); iterator.isValid() && iterations < recordcount;
-             iterator.next()) {
-          final HashMap<String, ByteIterator> values = new HashMap<>();
-          deserializeValues(iterator.value(), fields, values);
-          result.add(values);
-          iterations++;
-        }
-      }
-
-      return Status.OK;
-    } catch(final RocksDBException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
-  }
-
-  @Override
-  public Status update(final String table, final String key, final Map<String, ByteIterator> values) {
-    //TODO(AR) consider if this would be faster with merge operator
-
-    try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
-
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      final Map<String, ByteIterator> result = new HashMap<>();
-      final byte[] currentValues = rocksDb.get(cf, key.getBytes(UTF_8));
-      if(currentValues == null) {
-        return Status.NOT_FOUND;
-      }
-      deserializeValues(currentValues, null, result);
-
-      //update
-      result.putAll(values);
-
-      //store
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(result));
-
-      return Status.OK;
-
-    } catch(final RocksDBException | IOException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
-  }
-
-  @Override
-  public Status insert(final String table, final String key, final Map<String, ByteIterator> values) {
-    try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
-
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(values));
-
-      return Status.OK;
-    } catch(final RocksDBException | IOException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
-  }
-
-  @Override
-  public Status delete(final String table, final String key) {
-    try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
-
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      rocksDb.delete(cf, key.getBytes(UTF_8));
-
-      return Status.OK;
-    } catch(final RocksDBException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
-  }
-
-  private void saveColumnFamilyNames() throws IOException {
-    final Path file = rocksDbDir.resolve(COLUMN_FAMILY_NAMES_FILENAME);
-    try(final PrintWriter writer = new PrintWriter(Files.newBufferedWriter(file, UTF_8))) {
-      writer.println(new String(RocksDB.DEFAULT_COLUMN_FAMILY, UTF_8));
-      for(final String cfName : COLUMN_FAMILIES.keySet()) {
-        writer.println(cfName);
-      }
-    }
-  }
-
-  private List<String> loadColumnFamilyNames() throws IOException {
-    final List<String> cfNames = new ArrayList<>();
-    final Path file = rocksDbDir.resolve(COLUMN_FAMILY_NAMES_FILENAME);
-    if(Files.exists(file)) {
-      try (final LineNumberReader reader =
-               new LineNumberReader(Files.newBufferedReader(file, UTF_8))) {
-        String line = null;
-        while ((line = reader.readLine()) != null) {
-          cfNames.add(line);
-        }
-      }
-    }
-    return cfNames;
-  }
-
-  private Map<String, ByteIterator> deserializeValues(final byte[] values, final Set<String> fields,
-      final Map<String, ByteIterator> result) {
-    final ByteBuffer buf = ByteBuffer.allocate(4);
-
-    int offset = 0;
-    while(offset < values.length) {
-      buf.put(values, offset, 4);
-      buf.flip();
-      final int keyLen = buf.getInt();
-      buf.clear();
-      offset += 4;
-
-      final String key = new String(values, offset, keyLen);
-      offset += keyLen;
-
-      buf.put(values, offset, 4);
-      buf.flip();
-      final int valueLen = buf.getInt();
-      buf.clear();
-      offset += 4;
-
-      if(fields == null || fields.contains(key)) {
-        result.put(key, new ByteArrayByteIterator(values, offset, valueLen));
-      }
-
-      offset += valueLen;
-    }
-
-    return result;
-  }
-
-  private byte[] serializeValues(final Map<String, ByteIterator> values) throws IOException {
-    try(final ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-      final ByteBuffer buf = ByteBuffer.allocate(4);
-
-      for(final Map.Entry<String, ByteIterator> value : values.entrySet()) {
-        final byte[] keyBytes = value.getKey().getBytes(UTF_8);
-        final byte[] valueBytes = value.getValue().toArray();
-
-        buf.putInt(keyBytes.length);
-        baos.write(buf.array());
-        baos.write(keyBytes);
-
-        buf.clear();
-
-        buf.putInt(valueBytes.length);
-        baos.write(buf.array());
-        baos.write(valueBytes);
-
-        buf.clear();
-      }
-      return baos.toByteArray();
-    }
-  }
-
-  private ColumnFamilyOptions getDefaultColumnFamilyOptions(final String destinationCfName) {
-    final ColumnFamilyOptions cfOptions;
-
-    if (COLUMN_FAMILIES.containsKey("default")) {
-      LOGGER.warn("no column family options for \"" + destinationCfName + "\" " +
-                  "in options file - using options from \"default\"");
-      cfOptions = COLUMN_FAMILIES.get("default").getOptions();
-    } else {
-      LOGGER.warn("no column family options for either \"" + destinationCfName + "\" or " +
-                  "\"default\" in options file - initializing with empty configuration");
-      cfOptions = new ColumnFamilyOptions();
-    }
-    LOGGER.warn("Add a CFOptions section for \"" + destinationCfName + "\" to the options file, " +
-                "or subsequent runs on this DB will fail.");
-
-    return cfOptions;
-  }
-
-  private void createColumnFamily(final String name) throws RocksDBException {
-    COLUMN_FAMILY_LOCKS.putIfAbsent(name, new ReentrantLock());
-
-    final Lock l = COLUMN_FAMILY_LOCKS.get(name);
-    l.lock();
-    try {
-      if(!COLUMN_FAMILIES.containsKey(name)) {
-        final ColumnFamilyOptions cfOptions;
-
-        if (optionsFile != null) {
-          // RocksDB requires all options files to include options for the "default" column family;
-          // apply those options to this column family
-          cfOptions = getDefaultColumnFamilyOptions(name);
+  private String fetchFields(final Set<String> fields) {
+    StringBuilder query = new StringBuilder(
+        "fetch { \"fields\": [ match ($key, $field) isa key-field; $field has id $id, has val $val;");
+    if (fields != null) {
+      boolean first = true;
+      for (String field : fields) {
+        if (first) {
+          first = false;
         } else {
-          cfOptions = new ColumnFamilyOptions().optimizeLevelStyleCompaction();
+          query.append(" or ");
         }
-
-        final ColumnFamilyHandle cfHandle = rocksDb.createColumnFamily(
-            new ColumnFamilyDescriptor(name.getBytes(UTF_8), cfOptions)
-        );
-        COLUMN_FAMILIES.put(name, new ColumnFamily(cfHandle, cfOptions));
+        query.append("{ $id == \"").append(escape(field)).append("\"; }");
       }
-    } finally {
-      l.unlock();
+      query.append("; ");
+    }
+    query.append("fetch { \"id\": $id, \"value\": $val }; ] };");
+    return query.toString();
+  }
+
+  /**
+   * Read a record from the database. Each field/value pair from the result will
+   * be stored in a HashMap.
+   *
+   * @param table  The name of the table
+   * @param key    The record key of the record to read.
+   * @param fields The list of fields to read, or null for all of them
+   * @param result A HashMap of field/value pairs for the result
+   * @return Zero on success, a non-zero error code on error or "not found".
+   */
+  @Override
+  public Status read(
+      final String table, final String key, final Set<String> fields,
+      final Map<String, ByteIterator> result
+  ) {
+    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.READ)) {
+      String query = "match $table isa table, has id \"" + escape(table) +
+          "\"; ($table, $key) isa table-key; $key isa key, has id \"" + escape(key) + "\";" + fetchFields(fields);
+      ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
+      if (!response.hasNext()) {
+        return Status.NOT_FOUND;
+      }
+      JSON json = response.next();
+      for (JSON entry : json.asObject().get("fields").asArray()) {
+        result.put(entry.asObject().get("id").asString(),
+            new ByteArrayByteIterator(entry.asObject().get("value").asString().getBytes())
+        );
+      }
+      return Status.OK;
+    } catch (final TypeDBDriverException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
     }
   }
 
-  private static final class ColumnFamily {
-    private final ColumnFamilyHandle handle;
-    private final ColumnFamilyOptions options;
-
-    private ColumnFamily(final ColumnFamilyHandle handle, final ColumnFamilyOptions options) {
-      this.handle = handle;
-      this.options = options;
+  /**
+   * Perform a range scan for a set of records in the database. Each field/value
+   * pair from the result will be stored in a HashMap.
+   *
+   * @param table       The name of the table
+   * @param startKey    The record key of the first record to read.
+   * @param recordCount The number of records to read
+   * @param fields      The list of fields to read, or null for all of them
+   * @param result      A Vector of HashMaps, where each HashMap is a set field/value
+   *                    pairs for one record
+   * @return Zero on success, a non-zero error code on error. See the {@link DB}
+   * class's description for a discussion of error codes.
+   */
+  @Override
+  public Status scan(
+      String table, String startKey, int recordCount, Set<String> fields,
+      Vector<HashMap<String, ByteIterator>> result
+  ) {
+    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.READ)) {
+      String query = "match $table isa table, has id \"" + escape(table) + "\"; " +
+          "($table, $key) isa table-key; $key isa key, has id $kid; $kid >= \"" + escape(startKey) + "\"; " +
+          "sort $kid; limit " + recordCount + "; " + fetchFields(fields);
+      ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
+      if (!response.hasNext()) {
+        return Status.NOT_FOUND;
+      }
+      response.stream().forEach(json -> {
+          HashMap<String, ByteIterator> resultMap = new HashMap<>();
+          for (JSON entry : json.asObject().get("fields").asArray()) {
+            resultMap.put(entry.asObject().get("id").asString(),
+                new ByteArrayByteIterator(entry.asObject().get("value").asString().getBytes())
+            );
+          }
+          result.add(resultMap);
+        }
+      );
+      return Status.OK;
+    } catch (final TypeDBDriverException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
     }
+  }
 
-    public ColumnFamilyHandle getHandle() {
-      return handle;
+  /**
+   * Update a record in the database. Any field/value pairs in the specified
+   * values HashMap will be written into the record with the specified record
+   * key, overwriting any existing values with the same field name.
+   *
+   * @param table  The name of the table
+   * @param key    The record key of the record to write.
+   * @param values A HashMap of field/value pairs to update in the record
+   * @return Zero on success, a non-zero error code on error. See this class's
+   * description for a discussion of error codes.
+   */
+  @Override
+  public Status update(String table, String key, Map<String, ByteIterator> values) {
+    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
+      StringBuilder query = new StringBuilder("match $table isa table, has id \"").append(escape(table)).append("\";")
+          .append("match (table: $table, key: $key) isa table-key; $key isa key, has id \"").append(escape(key))
+          .append("\";");
+      int i = 0;
+      for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
+        query.append("put $field-").append(i).append(" isa field, has id \"").append(escape(entry.getKey()))
+            .append("\"; (key: $key, field: $field-").append(i).append(") isa key-field;");
+        query.append("update $field-").append(i).append(" has val \"").append(escape(entry.getValue().toString()))
+            .append("\";");
+        i += 1;
+      }
+      ConceptRowIterator stream = transaction.query(query.toString()).resolve().asConceptRows();
+      if (stream.hasNext()) {
+        transaction.commit();
+        return Status.OK;
+      } else {
+        return Status.NOT_FOUND;
+      }
+    } catch (final TypeDBDriverException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
     }
+  }
 
-    public ColumnFamilyOptions getOptions() {
-      return options;
+  /**
+   * Insert a record in the database. Any field/value pairs in the specified
+   * values HashMap will be written into the record with the specified record
+   * key.
+   *
+   * @param table  The name of the table
+   * @param key    The record key of the record to insert.
+   * @param values A HashMap of field/value pairs to insert in the record
+   * @return Zero on success, a non-zero error code on error. See the {@link DB}
+   * class's description for a discussion of error codes.
+   */
+  @Override
+  public Status insert(String table, String key, Map<String, ByteIterator> values) {
+    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
+      StringBuilder query = new StringBuilder("put $table isa table, has id \"").append(escape(table)).append("\";")
+          .append("put (table: $table, key: $key) isa table-key; $key isa key, has id \"").append(escape(key))
+          .append("\";");
+      int i = 0;
+      for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
+        query.append("insert $field-").append(i).append(" isa field, has id \"").append(escape(entry.getKey()))
+            .append("\", has val \"").append(escape(entry.getValue().toString()))
+            .append("\"; (key: $key, field: $field-").append(i).append(") isa key-field;");
+        i += 1;
+      }
+      transaction.query(query.toString()).resolve();
+      transaction.commit();
+      return Status.OK;
+    } catch (final TypeDBDriverException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    }
+  }
+
+  /**
+   * Delete a record from the database.
+   *
+   * @param table The name of the table
+   * @param key   The record key of the record to delete.
+   * @return Zero on success, a non-zero error code on error. See the {@link DB}
+   * class's description for a discussion of error codes.
+   */
+  @Override
+  public Status delete(String table, String key) {
+    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
+      StringBuilder query = new StringBuilder("match $table isa table, has id \"").append(escape(table))
+          .append("\"; ($table, $key) isa table-key; $key isa key, has id \"").append(escape(key)).append("\";")
+          .append("$kf links ($key, $field), isa key-field; $field isa field;").append("delete $kf; $field;");
+      transaction.query(query.toString()).resolve();
+      query = new StringBuilder("match $table isa table, has id \"").append(escape(table))
+          .append("\"; $tk links ($table, $key), isa table-key; $key isa key, has id \"").append(escape(key))
+          .append("\";").append("delete $tk; $key;");
+      if (!transaction.query(query.toString()).resolve().asConceptRows().hasNext()) {
+        return Status.NOT_FOUND;
+      }
+      transaction.commit();
+      return Status.OK;
+    } catch (final TypeDBDriverException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
     }
   }
 }
