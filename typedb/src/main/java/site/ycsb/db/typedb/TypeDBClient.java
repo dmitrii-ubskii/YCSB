@@ -196,6 +196,26 @@ public class TypeDBClient extends DB {
    */
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
+    return upsert(table, key, values);
+  }
+
+  /**
+   * Insert a record in the database. Any field/value pairs in the specified
+   * values HashMap will be written into the record with the specified record
+   * key.
+   *
+   * @param table  The name of the table
+   * @param key    The record key of the record to insert.
+   * @param values A HashMap of field/value pairs to insert in the record
+   * @return Zero on success, a non-zero error code on error. See the {@link DB}
+   * class's description for a discussion of error codes.
+   */
+  @Override
+  public Status insert(String table, String key, Map<String, ByteIterator> values) {
+    return upsert(table, key, values);
+  }
+
+  private Status upsert(String table, String key, Map<String, ByteIterator> values) {
     try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
       StringBuilder query = new StringBuilder("match $table isa table, has id \"").append(escape(table)).append("\";")
           .append("match (table: $table, key: $key) isa table-key; $key isa key, has id \"").append(escape(key))
@@ -215,39 +235,6 @@ public class TypeDBClient extends DB {
       } else {
         return Status.NOT_FOUND;
       }
-    } catch (final TypeDBDriverException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
-  }
-
-  /**
-   * Insert a record in the database. Any field/value pairs in the specified
-   * values HashMap will be written into the record with the specified record
-   * key.
-   *
-   * @param table  The name of the table
-   * @param key    The record key of the record to insert.
-   * @param values A HashMap of field/value pairs to insert in the record
-   * @return Zero on success, a non-zero error code on error. See the {@link DB}
-   * class's description for a discussion of error codes.
-   */
-  @Override
-  public Status insert(String table, String key, Map<String, ByteIterator> values) {
-    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
-      StringBuilder query = new StringBuilder("put $table isa table, has id \"").append(escape(table)).append("\";")
-          .append("put (table: $table, key: $key) isa table-key; $key isa key, has id \"").append(escape(key))
-          .append("\";");
-      int i = 0;
-      for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
-        query.append("insert $field-").append(i).append(" isa field, has id \"").append(escape(entry.getKey()))
-            .append("\", has val \"").append(escape(entry.getValue().toString()))
-            .append("\"; (key: $key, field: $field-").append(i).append(") isa key-field;");
-        i += 1;
-      }
-      transaction.query(query.toString()).resolve();
-      transaction.commit();
-      return Status.OK;
     } catch (final TypeDBDriverException e) {
       LOGGER.error(e.getMessage(), e);
       return Status.ERROR;
