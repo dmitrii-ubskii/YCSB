@@ -40,9 +40,9 @@ import java.util.*;
  * See {@code typedb/README.md} for details.
  */
 public class TypeDBClient extends DB {
-  private static final String DATABASE_NAME = "ycsb";
-
   private static final Logger LOGGER = LoggerFactory.getLogger(TypeDBClient.class);
+
+  private final Set<String> tables = new HashSet<>();
 
   @GuardedBy("TypeDBClient.class")
   private static Driver driver = null;
@@ -54,21 +54,27 @@ public class TypeDBClient extends DB {
         driver = TypeDB.driver(TypeDB.DEFAULT_ADDRESS, new Credentials("admin", "password"),
             new DriverOptions(false, null)
         );
-        if (!driver.databases().contains(DATABASE_NAME)) {
-          driver.databases().create(DATABASE_NAME);
-        }
-        try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.SCHEMA)) {
-          String schema = "define entity table, owns id, plays table-key:table;\n" +
-              "entity key, owns id, plays table-key:key, plays key-field:key;\n" +
-              "entity field, owns id, owns val, plays key-field:field;\n" +
-              "relation table-key, relates table, relates key;\n" +
-              "relation key-field, relates key, relates field;\n" + "attribute id, value string;\n" +
-              "attribute val, value string;\n";
-          transaction.query(schema).resolve();
-          transaction.commit();
-        }
       }
     }
+  }
+
+  private void ensureTable(String table) {
+    if (tables.contains(table)) {
+      return;
+    }
+    if (!driver.databases().contains(table)) {
+      driver.databases().create(table);
+    }
+    try (Transaction transaction = driver.transaction(table, Transaction.Type.SCHEMA)) {
+      String schema = "define\n" +
+          "entity key, owns id @key, plays key-field:key;\n" +
+          "entity field, owns id, owns val, plays key-field:field;\n" +
+          "relation key-field, relates key, relates field;\n" + "attribute id, value string;\n" +
+          "attribute val, value string;\n";
+      transaction.query(schema).resolve();
+      transaction.commit();
+    }
+    tables.add(table);
   }
 
   /**
@@ -80,10 +86,16 @@ public class TypeDBClient extends DB {
     super.cleanup();
   }
 
-  private String escape(String s) {
-    String z = s.replace("\\", "\\\\").replace("\"", "\\\"");
-    System.out.println(z);
-    return z;
+  private static String escape(String s) {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"");
+  }
+
+  private static String encode(byte[] bytes) {
+    return Base64.getEncoder().encodeToString(bytes);
+  }
+
+  private static ByteIterator decode(String encoded) {
+    return new ByteArrayByteIterator(Base64.getDecoder().decode(encoded));
   }
 
   private String fetchFields(final Set<String> fields) {
@@ -120,18 +132,15 @@ public class TypeDBClient extends DB {
       final String table, final String key, final Set<String> fields,
       final Map<String, ByteIterator> result
   ) {
-    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.READ)) {
-      String query = "match $table isa table, has id \"" + escape(table) +
-          "\"; ($table, $key) isa table-key; $key isa key, has id \"" + escape(key) + "\";" + fetchFields(fields);
+    try (Transaction transaction = driver.transaction("ycsb-" + table, Transaction.Type.READ)) {
+      String query = "match $key isa key, has id \"" + escape(key) + "\"; limit 1;" + fetchFields(fields);
       ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
       if (!response.hasNext()) {
         return Status.NOT_FOUND;
       }
       JSON json = response.next();
       for (JSON entry : json.asObject().get("fields").asArray()) {
-        result.put(entry.asObject().get("id").asString(),
-            new ByteArrayByteIterator(entry.asObject().get("value").asString().getBytes())
-        );
+        result.put(entry.asObject().get("id").asString(), decode(entry.asObject().get("value").asString()));
       }
       return Status.OK;
     } catch (final TypeDBDriverException e) {
@@ -158,10 +167,10 @@ public class TypeDBClient extends DB {
       String table, String startKey, int recordCount, Set<String> fields,
       Vector<HashMap<String, ByteIterator>> result
   ) {
-    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.READ)) {
-      String query = "match $table isa table, has id \"" + escape(table) + "\"; " +
-          "($table, $key) isa table-key; $key isa key, has id $kid; $kid >= \"" + escape(startKey) + "\"; " +
-          "sort $kid; limit " + recordCount + "; " + fetchFields(fields);
+    String ycsbTable = "ycsb-" + table;
+    try (Transaction transaction = driver.transaction(ycsbTable, Transaction.Type.READ)) {
+      String query = "match $key isa key, has id $kid; $kid >= \"" + escape(startKey) + "\"; " + "sort $kid; limit " +
+          recordCount + "; " + fetchFields(fields);
       ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
       if (!response.hasNext()) {
         return Status.NOT_FOUND;
@@ -169,9 +178,7 @@ public class TypeDBClient extends DB {
       response.stream().forEach(json -> {
           HashMap<String, ByteIterator> resultMap = new HashMap<>();
           for (JSON entry : json.asObject().get("fields").asArray()) {
-            resultMap.put(entry.asObject().get("id").asString(),
-                new ByteArrayByteIterator(entry.asObject().get("value").asString().getBytes())
-            );
+            resultMap.put(entry.asObject().get("id").asString(), decode(entry.asObject().get("value").asString()));
           }
           result.add(resultMap);
         }
@@ -216,17 +223,14 @@ public class TypeDBClient extends DB {
   }
 
   private Status upsert(String table, String key, Map<String, ByteIterator> values) {
-    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
-      StringBuilder query = new StringBuilder("match $table isa table, has id \"").append(escape(table)).append("\";")
-          .append("match (table: $table, key: $key) isa table-key; $key isa key, has id \"").append(escape(key))
-          .append("\";");
-      int i = 0;
+    String ycsbTable = "ycsb-" + table;
+    ensureTable(ycsbTable);
+    try (Transaction transaction = driver.transaction(ycsbTable, Transaction.Type.WRITE)) {
+      StringBuilder query = new StringBuilder("put $key isa key, has id \"").append(escape(key)).append("\";");
       for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
-        query.append("put $field-").append(i).append(" isa field, has id \"").append(escape(entry.getKey()))
-            .append("\"; (key: $key, field: $field-").append(i).append(") isa key-field;");
-        query.append("update $field-").append(i).append(" has val \"").append(escape(entry.getValue().toString()))
-            .append("\";");
-        i += 1;
+        query.append("put $field isa field, has id \"").append(escape(entry.getKey()))
+            .append("\"; (key: $key, field: $field) isa key-field;").append("update $field has val \"")
+            .append(encode(entry.getValue().toArray())).append("\"; select $key;");
       }
       ConceptRowIterator stream = transaction.query(query.toString()).resolve().asConceptRows();
       if (stream.hasNext()) {
@@ -251,14 +255,13 @@ public class TypeDBClient extends DB {
    */
   @Override
   public Status delete(String table, String key) {
-    try (Transaction transaction = driver.transaction(DATABASE_NAME, Transaction.Type.WRITE)) {
-      StringBuilder query = new StringBuilder("match $table isa table, has id \"").append(escape(table))
-          .append("\"; ($table, $key) isa table-key; $key isa key, has id \"").append(escape(key)).append("\";")
+    String ycsbTable = "ycsb-" + table;
+    try (Transaction transaction = driver.transaction(ycsbTable, Transaction.Type.WRITE)) {
+      StringBuilder query = new StringBuilder("match $key isa key, has id \"").append(escape(key)).append("\";")
           .append("$kf links ($key, $field), isa key-field; $field isa field;").append("delete $kf; $field;");
       transaction.query(query.toString()).resolve();
-      query = new StringBuilder("match $table isa table, has id \"").append(escape(table))
-          .append("\"; $tk links ($table, $key), isa table-key; $key isa key, has id \"").append(escape(key))
-          .append("\";").append("delete $tk; $key;");
+      query = new StringBuilder("match $key isa key, has id \"").append(escape(key)).append("\";")
+          .append("delete $tk; $key;");
       if (!transaction.query(query.toString()).resolve().asConceptRows().hasNext()) {
         return Status.NOT_FOUND;
       }
