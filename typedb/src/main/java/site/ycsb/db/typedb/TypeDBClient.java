@@ -22,9 +22,7 @@ import com.typedb.driver.api.Credentials;
 import com.typedb.driver.api.Driver;
 import com.typedb.driver.api.DriverOptions;
 import com.typedb.driver.api.Transaction;
-import com.typedb.driver.api.answer.ConceptDocumentIterator;
 import com.typedb.driver.api.answer.ConceptRowIterator;
-import com.typedb.driver.api.answer.JSON;
 import com.typedb.driver.api.database.Database;
 import com.typedb.driver.common.exception.TypeDBDriverException;
 import site.ycsb.*;
@@ -66,6 +64,14 @@ public class TypeDBClient extends DB {
     }
   }
 
+  Transaction transaction() {
+    return transaction;
+  }
+
+  Logger logger() {
+    return LOGGER;
+  }
+
   private void ensureTable(String table) {
     if (tables.contains(table)) {
       return;
@@ -86,7 +92,7 @@ public class TypeDBClient extends DB {
     tables.add(table);
   }
 
-  private void ensureTransaction(String table) {
+  void ensureTransaction(String table) {
     if (transaction != null && transactionWrites >= WRITES_PER_TRANSACTION) {
       transaction.commit();
       transactionWrites = 0;
@@ -112,21 +118,21 @@ public class TypeDBClient extends DB {
     }
   }
 
-  private static String escape(String s) {
+  static String escape(String s) {
     return s.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 
-  private static String encode(byte[] bytes) {
+  static String encode(byte[] bytes) {
     return Base64.getEncoder().encodeToString(bytes);
   }
 
-  private static ByteIterator decode(String encoded) {
+  static ByteIterator decode(String encoded) {
     return new ByteArrayByteIterator(Base64.getDecoder().decode(encoded));
   }
 
-  private String fetchFields(final Set<String> fields) {
+  private String getFields(final Set<String> fields) {
     StringBuilder query = new StringBuilder(
-        "fetch { \"fields\": [ match ($key, $field) isa key-field; $field has id $id, has val $val;");
+        "match try { ($key, $field) isa key-field; $field has id $id, has val $val;");
     if (fields != null) {
       boolean first = true;
       for (String field : fields) {
@@ -139,7 +145,7 @@ public class TypeDBClient extends DB {
       }
       query.append("; ");
     }
-    query.append("fetch { \"id\": $id, \"value\": $val }; ] };");
+    query.append("};");
     return query.toString();
   }
 
@@ -161,15 +167,15 @@ public class TypeDBClient extends DB {
     try {
       String ycsbTable = "ycsb-" + table;
       ensureTransaction(ycsbTable);
-      String query = "match $key isa key, has id \"" + escape(key) + "\"; limit 1;" + fetchFields(fields);
-      ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
+      String query = "match $key isa key, has id \"" + escape(key) + "\"; limit 1;" + getFields(fields);
+      ConceptRowIterator response = transaction.query(query).resolve().asConceptRows();
       if (!response.hasNext()) {
         return Status.NOT_FOUND;
       }
-      JSON json = response.next();
-      for (JSON entry : json.asObject().get("fields").asArray()) {
-        result.put(entry.asObject().get("id").asString(), decode(entry.asObject().get("value").asString()));
-      }
+      response.stream().filter(row -> row.get("id").isPresent()).forEach(
+          row -> result.put(row.get("id").get().asAttribute().getString(),
+              decode(row.get("val").get().asAttribute().getString())
+          ));
       return Status.OK;
     } catch (final TypeDBDriverException e) {
       LOGGER.error(e.getMessage(), e);
@@ -199,19 +205,23 @@ public class TypeDBClient extends DB {
       String ycsbTable = "ycsb-" + table;
       ensureTransaction(ycsbTable);
       String query = "match $key isa key, has id $kid; $kid >= \"" + escape(startKey) + "\"; " + "sort $kid; limit " +
-          recordCount + "; " + fetchFields(fields);
-      ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
+          recordCount + "; " + getFields(fields);
+      ConceptRowIterator response = transaction.query(query).resolve().asConceptRows();
       if (!response.hasNext()) {
         return Status.NOT_FOUND;
       }
-      response.stream().forEach(json -> {
-          HashMap<String, ByteIterator> resultMap = new HashMap<>();
-          for (JSON entry : json.asObject().get("fields").asArray()) {
-            resultMap.put(entry.asObject().get("id").asString(), decode(entry.asObject().get("value").asString()));
+      HashMap<String, HashMap<String, ByteIterator>> resultMap = new HashMap<>();
+      response.stream().forEach(row -> {
+          String kid = row.get("kid").get().asAttribute().getString();
+          resultMap.putIfAbsent(kid, new HashMap<>());
+          if (row.get("id").isPresent()) {
+            resultMap.get(kid).put(row.get("id").get().asAttribute().getString(),
+                decode(row.get("val").get().asAttribute().getString())
+            );
           }
-          result.add(resultMap);
         }
       );
+      result.addAll(resultMap.values());
       return Status.OK;
     } catch (final TypeDBDriverException e) {
       LOGGER.error(e.getMessage(), e);
