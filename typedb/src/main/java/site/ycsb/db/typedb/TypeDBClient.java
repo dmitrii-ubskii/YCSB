@@ -64,8 +64,20 @@ public class TypeDBClient extends DB {
     }
   }
 
+  Set<String> tables() {
+    return tables;
+  }
+
+  Driver driver() {
+    return driver;
+  }
+
   Transaction transaction() {
     return transaction;
+  }
+
+  void transactionWritesInc() {
+    transactionWrites++;
   }
 
   Logger logger() {
@@ -261,7 +273,7 @@ public class TypeDBClient extends DB {
     return upsert(table, key, values);
   }
 
-  private Status upsert(String table, String key, Map<String, ByteIterator> values) {
+  Status upsert(String table, String key, Map<String, ByteIterator> values) {
     try {
       String ycsbTable = "ycsb-" + table;
       ensureTable(ycsbTable);
