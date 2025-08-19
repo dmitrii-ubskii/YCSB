@@ -25,6 +25,7 @@ import com.typedb.driver.api.Transaction;
 import com.typedb.driver.api.answer.ConceptDocumentIterator;
 import com.typedb.driver.api.answer.ConceptRowIterator;
 import com.typedb.driver.api.answer.JSON;
+import com.typedb.driver.api.database.Database;
 import com.typedb.driver.common.exception.TypeDBDriverException;
 import site.ycsb.*;
 import site.ycsb.Status;
@@ -33,6 +34,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * TypeDB binding
@@ -42,10 +44,15 @@ import java.util.*;
 public class TypeDBClient extends DB {
   private static final Logger LOGGER = LoggerFactory.getLogger(TypeDBClient.class);
 
-  private final Set<String> tables = new HashSet<>();
+  @GuardedBy("TypeDBClient.class")
+  private static Set<String> tables = new HashSet<>();
 
   @GuardedBy("TypeDBClient.class")
   private static Driver driver = null;
+
+  private Transaction transaction = null;
+  private long transactionWrites = 0;
+  private static final long WRITES_PER_TRANSACTION = 10000;
 
   @Override
   public void init() {
@@ -55,6 +62,7 @@ public class TypeDBClient extends DB {
             new DriverOptions(false, null)
         );
       }
+      tables.addAll(driver.databases().all().stream().map(Database::name).collect(Collectors.toList()));
     }
   }
 
@@ -62,6 +70,7 @@ public class TypeDBClient extends DB {
     if (tables.contains(table)) {
       return;
     }
+    assert transaction == null;
     if (!driver.databases().contains(table)) {
       driver.databases().create(table);
     }
@@ -77,6 +86,18 @@ public class TypeDBClient extends DB {
     tables.add(table);
   }
 
+  private void ensureTransaction(String table) {
+    if (transaction != null && transactionWrites >= WRITES_PER_TRANSACTION) {
+      transaction.commit();
+      transactionWrites = 0;
+      transaction = null;
+    }
+    if (transaction == null) {
+      transaction = driver.transaction(table, Transaction.Type.WRITE);
+    }
+    assert transaction != null;
+  }
+
   /**
    * Cleanup any state for this DB.
    * Called once per DB instance; there is one DB instance per client thread.
@@ -84,6 +105,11 @@ public class TypeDBClient extends DB {
   @Override
   public void cleanup() throws DBException {
     super.cleanup();
+    if (transaction != null) {
+      transaction.commit();
+      transactionWrites = 0;
+      transaction = null;
+    }
   }
 
   private static String escape(String s) {
@@ -132,7 +158,9 @@ public class TypeDBClient extends DB {
       final String table, final String key, final Set<String> fields,
       final Map<String, ByteIterator> result
   ) {
-    try (Transaction transaction = driver.transaction("ycsb-" + table, Transaction.Type.READ)) {
+    try {
+      String ycsbTable = "ycsb-" + table;
+      ensureTransaction(ycsbTable);
       String query = "match $key isa key, has id \"" + escape(key) + "\"; limit 1;" + fetchFields(fields);
       ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
       if (!response.hasNext()) {
@@ -167,8 +195,9 @@ public class TypeDBClient extends DB {
       String table, String startKey, int recordCount, Set<String> fields,
       Vector<HashMap<String, ByteIterator>> result
   ) {
-    String ycsbTable = "ycsb-" + table;
-    try (Transaction transaction = driver.transaction(ycsbTable, Transaction.Type.READ)) {
+    try {
+      String ycsbTable = "ycsb-" + table;
+      ensureTransaction(ycsbTable);
       String query = "match $key isa key, has id $kid; $kid >= \"" + escape(startKey) + "\"; " + "sort $kid; limit " +
           recordCount + "; " + fetchFields(fields);
       ConceptDocumentIterator response = transaction.query(query).resolve().asConceptDocuments();
@@ -223,9 +252,10 @@ public class TypeDBClient extends DB {
   }
 
   private Status upsert(String table, String key, Map<String, ByteIterator> values) {
-    String ycsbTable = "ycsb-" + table;
-    ensureTable(ycsbTable);
-    try (Transaction transaction = driver.transaction(ycsbTable, Transaction.Type.WRITE)) {
+    try {
+      String ycsbTable = "ycsb-" + table;
+      ensureTable(ycsbTable);
+      ensureTransaction(ycsbTable);
       StringBuilder query = new StringBuilder("put $key isa key, has id \"").append(escape(key)).append("\";");
       for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
         query.append("put $field isa field, has id \"").append(escape(entry.getKey()))
@@ -234,7 +264,7 @@ public class TypeDBClient extends DB {
       }
       ConceptRowIterator stream = transaction.query(query.toString()).resolve().asConceptRows();
       if (stream.hasNext()) {
-        transaction.commit();
+        transactionWrites++;
         return Status.OK;
       } else {
         return Status.NOT_FOUND;
@@ -255,8 +285,10 @@ public class TypeDBClient extends DB {
    */
   @Override
   public Status delete(String table, String key) {
-    String ycsbTable = "ycsb-" + table;
-    try (Transaction transaction = driver.transaction(ycsbTable, Transaction.Type.WRITE)) {
+    try {
+      String ycsbTable = "ycsb-" + table;
+      ensureTable(ycsbTable);
+      ensureTransaction(ycsbTable);
       StringBuilder query = new StringBuilder("match $key isa key, has id \"").append(escape(key)).append("\";")
           .append("$kf links ($key, $field), isa key-field; $field isa field;").append("delete $kf; $field;");
       transaction.query(query.toString()).resolve();
@@ -265,7 +297,7 @@ public class TypeDBClient extends DB {
       if (!transaction.query(query.toString()).resolve().asConceptRows().hasNext()) {
         return Status.NOT_FOUND;
       }
-      transaction.commit();
+      transactionWrites++;
       return Status.OK;
     } catch (final TypeDBDriverException e) {
       LOGGER.error(e.getMessage(), e);
