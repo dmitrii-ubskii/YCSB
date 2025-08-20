@@ -44,11 +44,6 @@ LICENSE file.
 
   <dependencies>
     <dependency>
-      <groupId>org.rocksdb</groupId>
-      <artifactId>rocksdbjni</artifactId>
-      <version>${rocksdb.version}</version>
-    </dependency>
-    <dependency>
       <groupId>com.typedb</groupId>
       <artifactId>typedb-driver</artifactId>
       <version>${typedb.version}</version>
@@ -74,12 +69,6 @@ LICENSE file.
       <artifactId>slf4j-simple</artifactId>
       <version>1.7.25</version>
       <scope>runtime</scope>
-    </dependency>
-    <dependency>
-      <groupId>junit</groupId>
-      <artifactId>junit</artifactId>
-      <version>4.12</version>
-      <scope>test</scope>
     </dependency>
 
   </dependencies>
