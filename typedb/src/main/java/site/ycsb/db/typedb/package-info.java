@@ -16,7 +16,7 @@
  */
 
 /**
- * The RocksDB Java binding for <a href="http://rocksdb.org/">RocksDB</a>.
+ * The TypeDB Java binding for <a href="https://typedb.com/">TypeDB</a>.
  */
 package site.ycsb.db.typedb;
 
