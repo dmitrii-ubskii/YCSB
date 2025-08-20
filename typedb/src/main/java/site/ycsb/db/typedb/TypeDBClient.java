@@ -315,7 +315,7 @@ public class TypeDBClient extends DB {
           .append("$kf links ($key, $field), isa key-field; $field isa field;").append("delete $kf; $field;");
       transaction.query(query.toString()).resolve();
       query = new StringBuilder("match $key isa key, has id \"").append(escape(key)).append("\";")
-          .append("delete $tk; $key;");
+          .append("delete $key;");
       if (!transaction.query(query.toString()).resolve().asConceptRows().hasNext()) {
         return Status.NOT_FOUND;
       }
